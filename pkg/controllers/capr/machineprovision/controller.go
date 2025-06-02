@@ -851,7 +851,7 @@ func (h *handler) constructCertsSecret(machineName, machineNamespace string) (*c
 		certSecretData["internal-tls.crt"] = []byte(cert)
 	}
 
-	if secret, err := h.secrets.Get(namespace.System, "tls-additional"); err == nil {
+	if secret, err := h.secrets.Get(namespace.System, "tls-ca-additional"); err == nil {
 		for key, val := range secret.Data {
 			certSecretData[key] = val
 		}
