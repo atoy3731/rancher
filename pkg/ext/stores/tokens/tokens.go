@@ -9,7 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	reflect "reflect"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +20,7 @@ import (
 	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/auth/tokens"
 	"github.com/rancher/rancher/pkg/auth/tokens/hashers"
+	extcommon "github.com/rancher/rancher/pkg/ext/common"
 	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rancher/pkg/wrangler"
@@ -42,6 +43,7 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
+	"k8s.io/client-go/features"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/kubernetes/pkg/printers"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
@@ -49,7 +51,7 @@ import (
 
 const (
 	TokenNamespace       = "cattle-tokens"
-	UserIDLabel          = "authn.management.cattle.io/token-userId"
+	UserIDLabel          = "cattle.io/user-id"
 	KindLabel            = "authn.management.cattle.io/kind"
 	IsLogin              = "session"
 	SecretKindLabel      = "cattle.io/kind"
@@ -108,8 +110,8 @@ type Store struct {
 // words, it generally has access to all the tokens, in all ways.
 type SystemStore struct {
 	authorizer      authorizer.Authorizer
-	initialized     bool                // flag. set when this store ensured presence of the backing namespace
 	namespaceClient v1.NamespaceClient  // access to namespaces.
+	namespaceCache  v1.NamespaceCache   // quick access to namespaces.
 	secretClient    v1.SecretClient     // direct access to the backing secrets
 	secretCache     v1.SecretCache      // cached access to the backing secrets
 	userClient      v3.UserCache        // cached access to the v3.Users
@@ -126,6 +128,7 @@ func NewFromWrangler(wranglerContext *wrangler.Context, authorizer authorizer.Au
 	return New(
 		authorizer,
 		wranglerContext.Core.Namespace(),
+		wranglerContext.Core.Namespace().Cache(),
 		wranglerContext.Core.Secret(),
 		wranglerContext.Mgmt.User(),
 		wranglerContext.Mgmt.Token().Cache(),
@@ -142,6 +145,7 @@ func NewFromWrangler(wranglerContext *wrangler.Context, authorizer authorizer.Au
 func New(
 	authorizer authorizer.Authorizer,
 	namespaceClient v1.NamespaceClient,
+	namespaceCache v1.NamespaceCache,
 	secretClient v1.SecretController,
 	userClient v3.UserController,
 	tokenClient v3.TokenCache,
@@ -153,6 +157,7 @@ func New(
 		SystemStore: SystemStore{
 			authorizer:      authorizer,
 			namespaceClient: namespaceClient,
+			namespaceCache:  namespaceCache,
 			secretClient:    secretClient,
 			secretCache:     secretClient.Cache(),
 			userClient:      userClient.Cache(),
@@ -173,6 +178,7 @@ func New(
 func NewSystemFromWrangler(wranglerContext *wrangler.Context) *SystemStore {
 	return NewSystem(
 		wranglerContext.Core.Namespace(),
+		wranglerContext.Core.Namespace().Cache(),
 		wranglerContext.Core.Secret(),
 		wranglerContext.Mgmt.User(),
 		wranglerContext.Mgmt.Token().Cache(),
@@ -188,6 +194,7 @@ func NewSystemFromWrangler(wranglerContext *wrangler.Context) *SystemStore {
 // convenience function instead.
 func NewSystem(
 	namespaceClient v1.NamespaceClient,
+	namespaceCache v1.NamespaceCache,
 	secretClient v1.SecretController,
 	userClient v3.UserController,
 	tokenClient v3.TokenCache,
@@ -197,6 +204,7 @@ func NewSystem(
 ) *SystemStore {
 	tokenStore := SystemStore{
 		namespaceClient: namespaceClient,
+		namespaceCache:  namespaceCache,
 		secretClient:    secretClient,
 		secretCache:     secretClient.Cache(),
 		userClient:      userClient.Cache(),
@@ -232,6 +240,11 @@ func (t *Store) New() runtime.Object {
 
 // Destroy implements [rest.Storage], a required interface.
 func (t *Store) Destroy() {
+}
+
+// ensureNamespace ensures that the namespace for storing token secrets exists.
+func (t *SystemStore) ensureNamespace() error {
+	return extcommon.EnsureNamespace(t.namespaceCache, t.namespaceClient, TokenNamespace)
 }
 
 // Create implements [rest.Creator], the interface to support the `create`
@@ -473,19 +486,6 @@ func (t *SystemStore) Create(ctx context.Context, group schema.GroupResource, to
 	// check if the user does not wish to actually change anything
 	dryRun := options != nil && len(options.DryRun) > 0 && options.DryRun[0] == metav1.DryRunAll
 
-	// ensure existence of the namespace holding our secrets. run once per store.
-	if !dryRun && !t.initialized {
-		_, err := t.namespaceClient.Create(&corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: TokenNamespace,
-			},
-		})
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, err
-		}
-		t.initialized = true
-	}
-
 	user, err := t.userClient.Get(token.Spec.UserID)
 	if err != nil {
 		return nil, apierrors.NewInternalError(fmt.Errorf("failed to retrieve user %s: %w",
@@ -553,6 +553,10 @@ func (t *SystemStore) Create(ctx context.Context, group schema.GroupResource, to
 	// enforce our choice of name, without racing create
 	secret.ObjectMeta.Name = ""
 	secret.ObjectMeta.GenerateName = GeneratePrefix
+
+	if err = t.ensureNamespace(); err != nil {
+		return nil, apierrors.NewInternalError(fmt.Errorf("error ensuring namespace %s: %w", TokenNamespace, err))
+	}
 
 	newSecret, err := t.secretClient.Create(secret)
 	if err != nil {
@@ -910,17 +914,22 @@ func (t *Store) watch(ctx context.Context, options *metav1.ListOptions) (watch.I
 		return consumer, nil
 	}
 
+	if !features.FeatureGates().Enabled(features.WatchListClient) {
+		localOptions.SendInitialEvents = nil
+		localOptions.ResourceVersionMatch = ""
+	}
+
+	producer, err := t.secretClient.Watch(TokenNamespace, localOptions)
+	if err != nil {
+		logrus.Errorf("tokens: watch: error starting watch: %s", err)
+		return nil, apierrors.NewInternalError(fmt.Errorf("tokens: watch: error starting watch: %w", err))
+	}
+
 	sessionID := t.auth.SessionID(ctx)
 
 	// watch the backend secrets for changes and transform their events into
 	// the appropriate token events.
 	go func() {
-		producer, err := t.secretClient.Watch(TokenNamespace, localOptions)
-		if err != nil {
-			logrus.Errorf("tokens: watch: error starting watch: %s", err)
-			return
-		}
-
 		defer producer.Stop()
 		for {
 			select {

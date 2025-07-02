@@ -16,6 +16,10 @@ vendor
 /tests/integration/MANIFEST
 tests/integration/MANIFEST
 tests/integration/.idea/
+/tests/v2/integration/steveapi/json/
+/tests/v2/integration/steveapi/output.csv
+tests/v2/integration/steveapi/json/
+tests/v2/integration/steveapi/output.csv
 /tests/.cache
 /tests/.tox
 /tests/integration/.tox/
@@ -37,3 +41,6 @@ kontainer-engine
 k3s-images.txt
 k3s-airgap-images.tar
 data.json
+informer_object_cache.db
+informer_object_cache.db-shm
+informer_object_cache.db-wal
