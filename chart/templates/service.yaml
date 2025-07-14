@@ -28,3 +28,30 @@ spec:
     name: https-internal
   selector:
     app: {{ template "rancher.fullname" . }}
+{{- if .Values.service.disableHTTP }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+{{- if .Values.service.annotations }}
+  annotations:
+{{ toYaml .Values.service.annotations | indent 4 }}
+{{- end }}
+  name: {{ template "rancher.fullname" . }}-external
+  labels:
+{{ include "rancher.labels" . | indent 4 }}
+spec:
+  {{- /*
+  If service.type is not provided this attribute is ommitted and k8s default of ClusterIP is used.
+  */}} 
+  {{- if .Values.service.type }}
+  type: {{ .Values.service.type }}
+  {{- end }}
+  ports:
+  - port: 443
+    targetPort: 443
+    protocol: TCP
+    name: https-external
+  selector:
+    app: {{ template "rancher.fullname" . }}
+{{- end }}

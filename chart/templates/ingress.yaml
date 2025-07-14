@@ -49,11 +49,11 @@ spec:
       - backend:
           {{- if or (.Capabilities.APIVersions.Has "networking.k8s.io/v1/Ingress") (not (.Capabilities.APIVersions.Has "networking.k8s.io/v1beta1/Ingress")) }}
           service:
-            name: {{ template "rancher.fullname" . }}
+            name: {{ template "rancher.fullname" . }}{{ if .Values.service.disableHTTP }}-external{{ end }}
             port:
               number: {{ .Values.ingress.servicePort }}
           {{- else }}
-          serviceName: {{ template "rancher.fullname" . }}
+          serviceName: {{ template "rancher.fullname" . }}{{ if .Values.service.disableHTTP }}-external{{ end }}
           servicePort: {{ .Values.ingress.servicePort }}
           {{- end }}
         {{- if or (.Capabilities.APIVersions.Has "networking.k8s.io/v1/Ingress") (not (.Capabilities.APIVersions.Has "networking.k8s.io/v1beta1/Ingress")) }}
